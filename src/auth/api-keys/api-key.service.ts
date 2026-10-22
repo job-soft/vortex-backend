@@ -86,4 +86,61 @@ export class ApiKeyService {
   async listKeys(owner: string): Promise<ApiKeyRecord[]> {
     return this.repo.listByOwner(owner);
   }
+
+  /**
+   * Create a self-service API key for an integrator (issue #707).
+   *
+   * The tier is hard-coded to `integrator` — callers cannot influence it, so
+   * the public signup flow can never mint a `solver` or `partner` key.
+   */
+  async createSelfServiceKey(email: string): Promise<{ record: ApiKeyRecord; plaintext: string }> {
+    return this.createKey({ tier: "integrator", owner: email });
+  }
+
+  /**
+   * Record one request against a key's current hourly usage bucket
+   * (issue #705). Fire-and-forget: usage tracking must never add latency to
+   * (or fail) the hot throttle path.
+   */
+  recordUsage(keyId: string, allowed: boolean, nowSec = Math.floor(Date.now() / 1000)): void {
+    const bucketStart = Math.floor(nowSec / 3600) * 3600;
+    void this.repo.incrementUsage(keyId, bucketStart, allowed).catch((err: unknown) => {
+      this.logger.debug(`Failed to record API key usage id=${keyId}: ${String(err)}`);
+    });
+  }
+
+  /**
+   * Fetch bucketed usage for a key between `fromSec` (inclusive) and `toSec`
+   * (exclusive), with allowed-vs-throttled totals.
+   */
+  async getUsage(
+    id: string,
+    fromSec: number,
+    toSec: number,
+  ): Promise<{
+    buckets: Array<{ start: number; allowed: number; throttled: number }>;
+    totals: { allowed: number; throttled: number };
+  }> {
+    const buckets = await this.repo.getUsage(id, fromSec, toSec);
+    const totals = buckets.reduce(
+      (acc, b) => ({ allowed: acc.allowed + b.allowed, throttled: acc.throttled + b.throttled }),
+      { allowed: 0, throttled: 0 },
+    );
+    return { buckets, totals };
+  }
+
+  /** Delete usage buckets older than `retentionSec` (bounded table growth). */
+  async pruneUsage(retentionSec: number, nowSec = Math.floor(Date.now() / 1000)): Promise<number> {
+    return this.repo.pruneUsage(nowSec - retentionSec);
+  }
+
+  /** Keys whose `expiresAt` falls within the next `windowSec` seconds (issue #708). */
+  async findExpiringSoon(windowSec: number, nowSec = Math.floor(Date.now() / 1000)): Promise<ApiKeyRecord[]> {
+    return this.repo.findExpiringBetween(nowSec, nowSec + windowSec);
+  }
+
+  /** Mark a key as having been warned about its upcoming expiry. */
+  async markExpiryWarned(id: string, nowSec = Math.floor(Date.now() / 1000)): Promise<void> {
+    await this.repo.markExpiryWarned(id, nowSec);
+  }
 }
